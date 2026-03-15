@@ -3,60 +3,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math, os, urllib.request, time
 
-# ── DEVICE ────────────────────────────────────────────────────────────────────
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-SEQ_LEN        = 128
-D_MODEL        = 256
-N_HEADS        = 8
-D_FF           = 1024
-BATCH_SIZE     = 32
-LR             = 3e-4
-STEPS          = 10000
-EVAL_EVERY     = 500
-EVAL_STEPS     = 30
+SEQ_LEN       = 128
+D_MODEL       = 256
+N_HEADS       = 8
+D_FF          = 1024
+BATCH_SIZE    = 32
+LR            = 3e-4
+STEPS         = 30000
+EVAL_EVERY    = 500
+EVAL_STEPS    = 30
 
-# Mind Palace specific
-N_ROOMS        = 3      # start with 4 — enough for real competition between rooms
-MAX_ROOMS      = 10     # never grow beyond this
-MIN_ROOMS      = 1      # never shrink below this
-HEAT_DECAY     = 0.990  # faster decay — unused rooms cool in ~300 steps
-DELETE_THRESH  = 0.30   # delete if heat drops below 30% — actually reachable now
-SPAWN_PATIENCE = 300    # wait this many steps before first spawn check
+# Mind Palace
+N_ROOMS       = 2       # start tiny — rooms earn the right to exist
+MAX_ROOMS     = 8
+MIN_ROOMS     = 1
+HEAT_DECAY    = 0.990
+DELETE_THRESH = 0.10    # was 0.25 — give rooms more time before deleting
+SPLIT_THRESH  = 0.95
+SPLIT_STREAK  = 8       # was 5 — wait longer before splitting again
+SPAWN_PAT     = 400     # steps before first manage call
+MAX_HOPS      = 3       # max rooms to traverse per forward pass
 
-
-# ── DATA ─────────────────────────────────────────────────────────────
-import os
-from datasets import load_dataset
+# ── DATA ──────────────────────────────────────────────────────────────────────
 DATA_PATH = "data.txt"
-TARGET_SIZE = 50_000_000   # 50MB
-if not os.path.exists(DATA_PATH):
-    print("Downloading ~50MB OpenWebText...")
-    ds = load_dataset(
-        "Skylion007/openwebtext",
-        split="train",
-        streaming=True
-    )
-    size = 0
-    chunks = []
-    for sample in ds:
-        txt = sample["text"] + "\n\n"
-        chunks.append(txt)
-        size += len(txt)
-        if size >= TARGET_SIZE:
-            break
-    text = "".join(chunks)
-    with open(DATA_PATH, "w", encoding="utf-8") as f:
-        f.write(text)
-    print("Saved dataset to data.txt")
+TARGET    = 100_000_000
 
-with open(DATA_PATH, "r", encoding="utf-8") as f:
+with open(DATA_PATH, encoding="utf-8") as f:
     text = f.read()
-
-print(f"Dataset size: {len(text)/1e6:.2f} MB")
-
+print(f"Dataset: {len(text)/1e6:.1f}MB")
 
 chars      = sorted(set(text))
 VOCAB_SIZE = len(chars)
@@ -78,55 +56,13 @@ def get_batch(split):
     y  = torch.stack([d[i+1:i+SEQ_LEN+1] for i in ix])
     return x, y
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# PIECE 1 — A SINGLE ROOM
-# Each room is a standard transformer block PLUS a summary vector.
-# The summary vector is a learned D_MODEL-dim description of what this room knows.
-# The router reads these summaries to decide which rooms to activate.
+# ROOM
+# A transformer block with:
+#   summary  — learned vector describing what this room knows
+#   heat     — usage tracker
+#   edges    — learned connections to other rooms (which rooms are related)
 # ══════════════════════════════════════════════════════════════════════════════
-
-class Room(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, room_id):
-        super().__init__()
-        self.room_id = room_id
-
-        # Standard transformer block (attention + feedforward)
-        self.attn  = SelfAttention(d_model, n_heads)
-        self.ff    = FeedForward(d_model, d_ff)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-
-        # ── THE NEW PART ──
-        # Summary vector: a single learned vector that describes what this room
-        # specializes in. Starts random, gets updated by backprop just like weights.
-        # Think of it as the "label on the door" of this room.
-        self.summary = nn.Parameter(torch.randn(d_model) * 0.01)
-
-        # Heat: tracks how often this room is activated (not a nn.Parameter,
-        # just a float we update manually — gradients don't flow through it)
-        self.register_buffer('heat', torch.tensor(1.0))
-
-    def forward(self, x, gate_score):
-        # gate_score: scalar 0..1 — how strongly to apply this room's output
-        # If gate_score ≈ 0, the room contributes almost nothing (effectively skipped)
-        # If gate_score ≈ 1, the room contributes fully
-        residual = x
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ff(self.norm2(x))
-        # Blend: gate_score=1 means full room output, gate_score=0 means pass through unchanged
-        return residual + gate_score.unsqueeze(-1).unsqueeze(-1) * (x - residual)
-
-    def update_heat(self, gate_score_mean):
-        # Decay heat slowly every step, then add the mean gate score for this step
-        # Rooms that get activated a lot stay hot. Rooms that don't get activated cool down.
-        self.heat = self.heat * HEAT_DECAY + (1 - HEAT_DECAY) * gate_score_mean
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PIECE 2 — SELF ATTENTION (unchanged from before)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class SelfAttention(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
@@ -136,244 +72,314 @@ class SelfAttention(nn.Module):
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
-
     def forward(self, x):
         B, T, C = x.shape
-        Q = self.W_q(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        K = self.W_k(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        V = self.W_v(x).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_head)
-        mask   = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-        scores = scores.masked_fill(mask, float('-inf'))
-        attn   = F.softmax(scores, dim=-1)
-        out    = (attn @ V).transpose(1, 2).contiguous().view(B, T, C)
-        return self.W_o(out)
-
+        Q = self.W_q(x).view(B,T,self.n_heads,self.d_head).transpose(1,2)
+        K = self.W_k(x).view(B,T,self.n_heads,self.d_head).transpose(1,2)
+        V = self.W_v(x).view(B,T,self.n_heads,self.d_head).transpose(1,2)
+        s = Q @ K.transpose(-2,-1) / math.sqrt(self.d_head)
+        s = s.masked_fill(torch.triu(torch.ones(T,T,device=x.device),1).bool(), float('-inf'))
+        return self.W_o((F.softmax(s,-1) @ V).transpose(1,2).contiguous().view(B,T,C))
 
 class FeedForward(nn.Module):
     def __init__(self, d_model, d_ff):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model)
-        )
+        self.net = nn.Sequential(nn.Linear(d_model,d_ff), nn.GELU(), nn.Linear(d_ff,d_model))
     def forward(self, x): return self.net(x)
 
+class Room(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, room_id):
+        super().__init__()
+        self.room_id = room_id
+        self.attn    = SelfAttention(d_model, n_heads)
+        self.ff      = FeedForward(d_model, d_ff)
+        self.norm1   = nn.LayerNorm(d_model)
+        self.norm2   = nn.LayerNorm(d_model)
+
+        # "the label on the door" — what this room knows
+        # trained by backprop to encode the room's specialization
+        self.summary = nn.Parameter(torch.randn(d_model) * 0.01)
+
+        # confidence gate — room outputs this to say "I handled this well"
+        # high confidence = don't need to visit more rooms
+        self.confidence_head = nn.Linear(d_model, 1)
+
+        self.register_buffer('heat',       torch.tensor(0.5))
+        self.register_buffer('hot_streak', torch.tensor(0))
+        self.register_buffer('age',        torch.tensor(0))   # evals survived
+
+    def forward(self, x, gate_score):
+        residual = x
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ff(self.norm2(x))
+        out = residual + gate_score.unsqueeze(-1).unsqueeze(-1) * (x - residual)
+        # confidence: mean pool → scalar per batch item
+        confidence = torch.sigmoid(self.confidence_head(out.mean(dim=1)))  # (B, 1)
+        return out, confidence
+
+    def update_heat(self, gate_mean):
+        self.heat = self.heat * HEAT_DECAY + (1 - HEAT_DECAY) * gate_mean
+        # hot_streak is updated manually at eval time, not here
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PIECE 3 — THE ROUTER  (v1 + v2 combined)
-#
-# v1: reads room summaries → computes relevance scores → gates each room
-# v2: computes a context vector from input → warps the adjacency between rooms
-#     so "nearby" rooms shift based on what's being processed
+# ROUTER
+# Reads all room summaries + input context.
+# Returns ranked list of rooms to visit, not just gate scores.
 # ══════════════════════════════════════════════════════════════════════════════
-
 class MindPalaceRouter(nn.Module):
     def __init__(self, d_model, n_rooms):
         super().__init__()
-        self.d_model = d_model
-
-        # Compresses the input sequence into a single context vector
-        # (mean pool → linear → the "what am I thinking about?" vector)
         self.context_proj = nn.Linear(d_model, d_model)
+        self.gate_proj    = nn.Linear(d_model, n_rooms)
+        # adjacency: room i → room j connection strength
+        # this is the "map" — which rooms are related
+        self.adjacency    = nn.Parameter(torch.eye(n_rooms) * 2 + torch.randn(n_rooms, n_rooms) * 0.1)
+        self.warp_proj    = nn.Linear(d_model, n_rooms * n_rooms)
 
-        # Gate projection: context vector → one score per room
-        self.gate_proj = nn.Linear(d_model, n_rooms)
-
-        # ── V2: DYNAMIC TOPOLOGY ──
-        # Adjacency matrix: learned base distances between rooms
-        # Shape (n_rooms, n_rooms) — how related is room i to room j?
-        # This is the "map" of the mind palace.
-        self.adjacency = nn.Parameter(torch.eye(n_rooms) + torch.randn(n_rooms, n_rooms) * 0.1)
-
-        # Context warp: given the context vector, output a small delta to the adjacency
-        # This is v2 — the map warps based on what we're thinking about
-        self.warp_proj  = nn.Linear(d_model, n_rooms * n_rooms)
-
-    def forward(self, x, room_summaries, hard=False):
-        B       = x.shape[0]
-        n_rooms = room_summaries.shape[0]
-
-        context = self.context_proj(x.mean(dim=1))                              # (B, D)
-        warp    = self.warp_proj(context).view(B, n_rooms, n_rooms) * 0.1
-        adj     = torch.softmax(self.adjacency.unsqueeze(0) + warp, dim=-1)     # (B, n, n)
-
-        summaries_exp = room_summaries.unsqueeze(0).expand(B, -1, -1)           # (B, n, D)
-        raw_scores    = (context.unsqueeze(1) * summaries_exp).sum(-1)          # (B, n)
-        warped_scores = (adj * raw_scores.unsqueeze(1)).sum(-1)                 # (B, n)
-
-        # gate_proj + temperature scaling stops sigmoid saturating to 1.0
-        gate_logits = self.gate_proj(context) + warped_scores                   # (B, n)
-        gates       = torch.sigmoid(gate_logits / 2.0)
-
+    def forward(self, x, summaries, hard=False):
+        B, n = x.shape[0], summaries.shape[0]
+        ctx  = self.context_proj(x.mean(1))                                    # (B, D)
+        warp = self.warp_proj(ctx).view(B, n, n) * 0.1
+        adj  = torch.softmax(self.adjacency.unsqueeze(0) + warp, dim=-1)       # (B, n, n)
+        raw  = (ctx.unsqueeze(1) * summaries.unsqueeze(0).expand(B,-1,-1)).sum(-1)  # (B, n)
+        gate_logits = self.gate_proj(ctx) + (adj * raw.unsqueeze(1)).sum(-1)   # (B, n)
+        gates = torch.sigmoid(gate_logits / 2.0)
         return (gates > 0.5).float() if hard else gates
 
+    def get_neighbors(self, room_idx, top_k=2):
+        """
+        Given a room we just visited, return the top_k most connected rooms.
+        This is how traversal works — after visiting room A, check its edges
+        to find the most relevant next rooms.
+        """
+        row = torch.softmax(self.adjacency[room_idx], dim=-1)
+        # exclude self
+        row[room_idx] = 0
+        _, neighbors = row.topk(min(top_k, len(row)-1))
+        return neighbors.tolist()
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PIECE 4 — THE MIND PALACE
-# Holds all the rooms + the router. Handles dynamic create/delete.
-# This is the main thing that replaces nn.Sequential in the old model.
+# MIND PALACE
+# The key new behavior:
+#   - traverse rooms in order of relevance
+#   - stop early if confidence is high enough (simple inputs → fewer rooms)
+#   - split overloaded rooms into two specialized children
+#   - delete cold rooms
 # ══════════════════════════════════════════════════════════════════════════════
-
 class MindPalace(nn.Module):
     def __init__(self, d_model, n_heads, d_ff, n_rooms):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_ff    = d_ff
-        # nn.ModuleList so PyTorch tracks all room parameters properly
-        self.rooms   = nn.ModuleList([
-            Room(d_model, n_heads, d_ff, room_id=i) for i in range(n_rooms)
-        ])
+        self.dev     = device   # store device explicitly — never rely on next(parameters())
+        self.rooms   = nn.ModuleList([Room(d_model, n_heads, d_ff, i) for i in range(n_rooms)])
         self.router  = MindPalaceRouter(d_model, n_rooms)
-        self._step   = 0   # internal step counter for spawn decisions
 
     @property
-    def n_rooms(self):
-        return len(self.rooms)
+    def n_rooms(self): return len(self.rooms)
 
     def get_summaries(self):
-        # Stack all room summary vectors into one matrix (n_rooms, D_MODEL)
         return torch.stack([r.summary for r in self.rooms])
 
-    def forward(self, x, hard=False):
+    def forward(self, x, hard=False, training=True):
         summaries   = self.get_summaries()
-        gate_scores = self.router(x, summaries, hard=hard)
+        gate_scores = self.router(x, summaries, hard=hard)   # (B, n_rooms)
 
-        out = x
-        for i, room in enumerate(self.rooms):
-            g   = gate_scores[:, i]
-            out = room(out, g)
+        # ── TRAVERSAL ──
+        # sort rooms by their gate score for this input (most relevant first)
+        # visit them in order, accumulate output, stop when confident enough
+        mean_gates   = gate_scores.mean(dim=0)                    # (n_rooms,)
+        visit_order  = mean_gates.argsort(descending=True).tolist()
+
+        out           = x
+        all_gates     = gate_scores
+        total_conf    = torch.zeros(x.shape[0], 1, device=x.device)
+        rooms_visited = 0
+
+        for room_idx in visit_order[:MAX_HOPS]:
+            room       = self.rooms[room_idx]
+            g          = gate_scores[:, room_idx]
+            out, conf  = room(out, g)
+            total_conf = total_conf + conf
+            rooms_visited += 1
             room.update_heat(g.mean().detach().item())
 
-        return out, gate_scores
+            # early exit: if average confidence is high enough, stop visiting rooms
+            # simple inputs stop here, complex inputs continue
+            if not training and (total_conf / rooms_visited).mean().item() > 0.85:
+                break
 
-    def manage_rooms(self, current_loss, prev_loss, loss_history):
-        """
-        Called every N steps during training.
-        Deletes cold rooms and spawns new ones if needed.
-        Returns a log string describing what happened.
+        return out, all_gates, rooms_visited
 
-        Spawn logic — smarter than before:
-          We keep a window of recent losses. If the improvement rate is
-          slowing down (we're on a plateau), spawn a new room to give the
-          model more capacity to break through.
-        """
+    def split_room(self, room_idx):
+        dev    = self.dev
+        parent = self.rooms[room_idx]
+        new_id = max(r.room_id for r in self.rooms) + 1
+
+        child_a = Room(self.d_model, self.n_heads, self.d_ff, room_id=new_id).to(dev)
+        child_b = Room(self.d_model, self.n_heads, self.d_ff, room_id=new_id + 1).to(dev)
+
+        # both children start as copies of parent then diverge via noise
+        # this is safer than weight-slicing (no dimension mismatch)
+        with torch.no_grad():
+            parent_params = dict(parent.named_parameters())
+            for (na, pa_val), (nb, pb_val) in zip(
+                child_a.named_parameters(), child_b.named_parameters()
+            ):
+                src   = parent_params[na].data
+                scale = src.abs().mean().item() * 0.3   # noise = 30% of weight magnitude
+                scale = max(scale, 0.01)                # at least 0.01
+                pa_val.copy_(src + torch.randn_like(src) * scale)
+                pb_val.copy_(src - torch.randn_like(src) * scale)
+
+        # summaries diverge strongly — forces router to distinguish them
+        child_a.summary.data = parent.summary.data.clone() + torch.randn_like(parent.summary) * 0.3
+        child_b.summary.data = parent.summary.data.clone() - torch.randn_like(parent.summary) * 0.3
+        child_a.heat.fill_(0.7)   # warm start — give them a real chance
+        child_b.heat.fill_(0.7)
+        child_a.hot_streak.fill_(0)
+        child_b.hot_streak.fill_(0)
+
+        return child_a, child_b
+
+    def manage_rooms(self, current_loss, loss_history):
         log = []
 
-        # ── DELETE cold rooms ──
+        # ── tick age and hot streaks at eval time ──
+        for room in self.rooms:
+            room.age += 1
+            if room.heat.item() > SPLIT_THRESH:
+                room.hot_streak += 1
+            else:
+                room.hot_streak.fill_(0)
+
+        # ── DELETE cold rooms — but only if old enough ──
         if self.n_rooms > MIN_ROOMS:
             to_delete = [i for i, r in enumerate(self.rooms)
-                         if r.heat.item() < DELETE_THRESH]
+                         if r.heat.item() < DELETE_THRESH and r.age.item() >= 6]
             for i in sorted(to_delete, reverse=True):
-                log.append(f"  🗑  deleted room {self.rooms[i].room_id} "
-                           f"(heat={self.rooms[i].heat.item():.3f})")
+                log.append(f"  🗑  deleted room {self.rooms[i].room_id}  (heat={self.rooms[i].heat.item():.3f})")
                 self.rooms.pop(i)
             if to_delete:
                 self._rebuild_router()
 
-        # ── SPAWN when improvement is slowing ──
-        if self.n_rooms < MAX_ROOMS and len(loss_history) >= 3:
-            # How much did loss improve over the last 3 evals?
-            recent_drop   = loss_history[-3] - loss_history[-1]
-            # How much did it improve in the 3 evals before that?
-            if len(loss_history) >= 6:
-                earlier_drop = loss_history[-6] - loss_history[-4]
-            else:
-                earlier_drop = recent_drop + 1   # force no spawn early on
+        # ── SPLIT overloaded rooms ──
+        if self.n_rooms < MAX_ROOMS - 1:
+            for i, room in enumerate(self.rooms):
+                if room.hot_streak.item() >= SPLIT_STREAK:
+                    log.append(f"  ✂️  splitting room {room.room_id}  (hot_streak={room.hot_streak.item()} evals)")
+                    child_a, child_b = self.split_room(i)
+                    self.rooms.pop(i)
+                    self.rooms.insert(i,   child_a)
+                    self.rooms.insert(i+1, child_b)
+                    self._rebuild_router()
+                    break
 
-            # Spawn if recent improvement is less than 40% of earlier improvement
-            # i.e. we're clearly slowing down and more capacity might help
-            improvement_ratio = recent_drop / (earlier_drop + 1e-8)
-            if improvement_ratio < 0.4 and recent_drop < 0.1:
+        # ── SPAWN if loss stalling and no split happened ──
+        elif self.n_rooms < MAX_ROOMS and len(loss_history) >= 6:
+            recent   = loss_history[-3] - loss_history[-1]
+            earlier  = loss_history[-6] - loss_history[-4]
+            ratio    = recent / (earlier + 1e-8)
+            if ratio < 0.4 and recent < 0.1:
+                hottest  = max(self.rooms, key=lambda r: r.heat.item())
                 new_id   = max(r.room_id for r in self.rooms) + 1
-                new_room = Room(self.d_model, self.n_heads, self.d_ff,
-                                room_id=new_id).to(next(self.parameters()).device)
-                new_room.heat.fill_(0.5)   # warm start — give it a fair chance
+                dev      = self.dev
+                new_room = Room(self.d_model, self.n_heads, self.d_ff, new_id).to(dev)
+                new_room.load_state_dict(hottest.state_dict())
+                with torch.no_grad():
+                    for p in new_room.parameters():
+                        p.add_(torch.randn_like(p) * 0.01)
+                new_room.room_id = new_id
+                new_room.heat.fill_(0.4)
                 self.rooms.append(new_room)
                 self._rebuild_router()
-                log.append(f"  ✨ spawned room {new_id} "
-                           f"(improvement slowing: ratio={improvement_ratio:.2f}, "
-                           f"loss={current_loss:.4f})")
+                log.append(f"  ✨ spawned room {new_id}  (loss stalling, ratio={ratio:.2f})")
 
         return log
 
     def _rebuild_router(self):
-        """Rebuild router when number of rooms changes."""
-        dev = next(self.parameters()).device
-        self.router = MindPalaceRouter(self.d_model, self.n_rooms).to(dev)
-
+        self.router = MindPalaceRouter(self.d_model, self.n_rooms).to(self.dev)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PIECE 5 — FULL MODEL
+# FULL MODEL
 # ══════════════════════════════════════════════════════════════════════════════
-
 class MindPalaceLLM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.token_emb  = nn.Embedding(VOCAB_SIZE, D_MODEL)
-        self.pos_emb    = nn.Embedding(SEQ_LEN, D_MODEL)
-        self.palace     = MindPalace(D_MODEL, N_HEADS, D_FF, N_ROOMS)
-        self.norm       = nn.LayerNorm(D_MODEL)
-        self.head       = nn.Linear(D_MODEL, VOCAB_SIZE)
+        self.token_emb = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.pos_emb   = nn.Embedding(SEQ_LEN, D_MODEL)
+        self.palace    = MindPalace(D_MODEL, N_HEADS, D_FF, N_ROOMS)
+        self.norm      = nn.LayerNorm(D_MODEL)
+        self.head      = nn.Linear(D_MODEL, VOCAB_SIZE)
 
     def forward(self, token_ids, targets=None, hard=False):
         B, T     = token_ids.shape
         x        = self.token_emb(token_ids) + self.pos_emb(torch.arange(T, device=token_ids.device))
-        x, gates = self.palace(x, hard=hard)
+        x, gates, n_visited = self.palace(x, hard=hard, training=targets is not None)
         logits   = self.head(self.norm(x))
         loss     = None
         if targets is not None:
             ce_loss      = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
             mean_gate    = gates.mean(dim=0)
-            balance_loss = -mean_gate.var()
-            loss         = ce_loss + 0.01 * balance_loss
-        return logits, loss
+            # only apply balance loss when we have 2+ rooms (var is 0 with 1 room)
+            if mean_gate.shape[0] > 1:
+                balance_loss = -mean_gate.var().clamp(min=-10, max=0)
+                loss = ce_loss + 0.05 * balance_loss
+            else:
+                loss = ce_loss
+        return logits, loss, n_visited
 
     @torch.no_grad()
-    def generate(self, prompt, max_new_tokens=300, temperature=0.8, hard=False):
+    def generate(self, prompt, max_new_tokens=300, temp=0.8, hard=False):
         self.eval()
         ids = torch.tensor(encode(prompt), dtype=torch.long).unsqueeze(0).to(device)
         for _ in range(max_new_tokens):
-            crop      = ids[:, -SEQ_LEN:]
-            logits, _ = self(crop, hard=hard)
-            probs     = F.softmax(logits[:, -1, :] / temperature, dim=-1)
-            next_id   = torch.multinomial(probs, 1)
-            ids       = torch.cat([ids, next_id], dim=1)
+            crop        = ids[:, -SEQ_LEN:]
+            logits, _,_ = self(crop, hard=hard)
+            probs       = F.softmax(logits[:, -1, :] / temp, dim=-1)
+            next_id     = torch.multinomial(probs, 1)
+            ids         = torch.cat([ids, next_id], dim=1)
         self.train()
         return decode(ids[0].tolist())
 
     def room_status(self):
         print(f"\n  Rooms: {self.palace.n_rooms}")
         for r in self.palace.rooms:
-            bar  = '█' * int(r.heat.item() * 20)
-            print(f"  Room {r.room_id:2d}  heat={r.heat.item():.3f}  {bar}")
+            h      = r.heat.item()
+            h      = 0.0 if (h != h) else h   # guard against NaN
+            filled = max(0, min(20, int(h * 20)))
+            bar    = '█' * filled + '░' * (20 - filled)
+            streak = f"  🔥 streak={r.hot_streak.item()}" if r.hot_streak.item() > 3 else ""
+            print(f"  Room {r.room_id:2d}  [{bar}]  heat={h:.3f}{streak}")
         print()
-
 
 # ── TRAINING ──────────────────────────────────────────────────────────────────
 model     = MindPalaceLLM().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 n_params  = sum(p.numel() for p in model.parameters())
-print(f"Model parameters: {n_params:,}")
-print(f"Starting with {N_ROOMS} rooms\n")
+print(f"Parameters: {n_params:,}  |  Starting rooms: {N_ROOMS}\n")
 
 @torch.no_grad()
 def estimate_loss():
     model.eval()
     out = {}
     for split in ['train', 'val']:
-        losses = [model(*get_batch(split))[1].item() for _ in range(EVAL_STEPS)]
+        losses = []
+        for _ in range(EVAL_STEPS):
+            xb, yb   = get_batch(split)
+            _, loss, _ = model(xb, yb)
+            losses.append(loss.item())
         out[split] = sum(losses) / len(losses)
     model.train()
     return out
 
-loss_history = []   # track eval losses over time for spawn decisions
+loss_history = []
 start        = time.time()
 
 for step in range(STEPS):
-    xb, yb  = get_batch('train')
-    _, loss = model(xb, yb)
-
+    xb, yb      = get_batch('train')
+    _, loss, nv = model(xb, yb)
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -385,26 +391,13 @@ for step in range(STEPS):
         loss_history.append(losses['train'])
         print(f"step {step:5d}  |  train: {losses['train']:.4f}  val: {losses['val']:.4f}"
               f"  |  rooms: {model.palace.n_rooms}  |  {elapsed:.1f} min")
-
-        # Show room heat map
         model.room_status()
 
-        # Let the palace manage itself — delete cold rooms, spawn if needed
-        if step >= SPAWN_PATIENCE:
-            prev = loss_history[-2] if len(loss_history) >= 2 else float('inf')
-            logs = model.palace.manage_rooms(losses['train'], prev, loss_history)
-            for lg in logs:
-                print(lg)
+        if step >= SPAWN_PAT:
+            logs = model.palace.manage_rooms(losses['train'], loss_history)
+            for lg in logs: print(lg)
             if logs:
-                # Rebuild optimizer whenever rooms change (parameters added/removed)
                 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-
-        # if step > 0 and step % 2000 == 0:
-        #     print("\n--- sample (normal) ---")
-        #     print(model.generate("ROMEO:", max_new_tokens=200))
-        #     print("\n--- sample (hard gates) ---")
-        #     print(model.generate("ROMEO:", max_new_tokens=200, hard=True))
-        #     print()
 
         if step > 0 and step % 2000 == 0:
             prompts = [
@@ -413,15 +406,12 @@ for step in range(STEPS):
                 "One of the most important discoveries",
             ]
             for p in prompts:
-                print(f"\n--- sample: {p} ---")
-                print(model.generate(p, max_new_tokens=200))
-
-            print("\n--- sample (hard gates) ---")
-            print(model.generate("The future of artificial intelligence", max_new_tokens=200, hard=True))
+                print(f"\n--- {p} ---")
+                print(model.generate(p, max_new_tokens=150))
             print()
 
 print("\n=== Final output ===")
-print(model.generate("ROMEO:", max_new_tokens=400))
+print(model.generate("The future of artificial intelligence", max_new_tokens=400))
 model.room_status()
 torch.save(model.state_dict(), "mindpalace_v1.pt")
 print("Saved to mindpalace_v1.pt")
