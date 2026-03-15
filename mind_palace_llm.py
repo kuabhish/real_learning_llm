@@ -19,21 +19,44 @@ EVAL_EVERY     = 500
 EVAL_STEPS     = 30
 
 # Mind Palace specific
-N_ROOMS        = 1      # START WITH 1 — rooms are earned, not given
+N_ROOMS        = 3      # start with 4 — enough for real competition between rooms
 MAX_ROOMS      = 10     # never grow beyond this
 MIN_ROOMS      = 1      # never shrink below this
 HEAT_DECAY     = 0.990  # faster decay — unused rooms cool in ~300 steps
 DELETE_THRESH  = 0.30   # delete if heat drops below 30% — actually reachable now
 SPAWN_PATIENCE = 300    # wait this many steps before first spawn check
 
-# ── DATA ──────────────────────────────────────────────────────────────────────
-DATA_URL  = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+
+# ── DATA ─────────────────────────────────────────────────────────────
+import os
+from datasets import load_dataset
 DATA_PATH = "data.txt"
+TARGET_SIZE = 50_000_000   # 50MB
 if not os.path.exists(DATA_PATH):
-    print("Downloading dataset...")
-    urllib.request.urlretrieve(DATA_URL, DATA_PATH)
-with open(DATA_PATH) as f:
+    print("Downloading ~50MB OpenWebText...")
+    ds = load_dataset(
+        "Skylion007/openwebtext",
+        split="train",
+        streaming=True
+    )
+    size = 0
+    chunks = []
+    for sample in ds:
+        txt = sample["text"] + "\n\n"
+        chunks.append(txt)
+        size += len(txt)
+        if size >= TARGET_SIZE:
+            break
+    text = "".join(chunks)
+    with open(DATA_PATH, "w", encoding="utf-8") as f:
+        f.write(text)
+    print("Saved dataset to data.txt")
+
+with open(DATA_PATH, "r", encoding="utf-8") as f:
     text = f.read()
+
+print(f"Dataset size: {len(text)/1e6:.2f} MB")
+
 
 chars      = sorted(set(text))
 VOCAB_SIZE = len(chars)
@@ -166,47 +189,23 @@ class MindPalaceRouter(nn.Module):
         # This is v2 — the map warps based on what we're thinking about
         self.warp_proj  = nn.Linear(d_model, n_rooms * n_rooms)
 
-    def forward(self, x, room_summaries, inference_mode=False):
-        # x: (B, T, D_MODEL)
-        # room_summaries: (n_rooms, D_MODEL) — the "door labels"
-
-        B = x.shape[0]
+    def forward(self, x, room_summaries, hard=False):
+        B       = x.shape[0]
         n_rooms = room_summaries.shape[0]
 
-        # Step 1 — compress input sequence to a single context vector
-        # Mean pool across the sequence dimension → (B, D_MODEL)
-        context = self.context_proj(x.mean(dim=1))   # (B, D_MODEL)
+        context = self.context_proj(x.mean(dim=1))                              # (B, D)
+        warp    = self.warp_proj(context).view(B, n_rooms, n_rooms) * 0.1
+        adj     = torch.softmax(self.adjacency.unsqueeze(0) + warp, dim=-1)     # (B, n, n)
 
-        # Step 2 — v2: compute context-dependent warp of the adjacency matrix
-        # warp_proj outputs (B, n_rooms * n_rooms), reshape to (B, n_rooms, n_rooms)
-        warp   = self.warp_proj(context).view(B, n_rooms, n_rooms) * 0.1
-        # Add warp to base adjacency (same base map, shifted by context)
-        adj    = self.adjacency.unsqueeze(0) + warp   # (B, n_rooms, n_rooms)
-        adj    = torch.softmax(adj, dim=-1)            # normalize rows
+        summaries_exp = room_summaries.unsqueeze(0).expand(B, -1, -1)           # (B, n, D)
+        raw_scores    = (context.unsqueeze(1) * summaries_exp).sum(-1)          # (B, n)
+        warped_scores = (adj * raw_scores.unsqueeze(1)).sum(-1)                 # (B, n)
 
-        # Step 3 — score each room by matching context against room summaries
-        # room_summaries: (n_rooms, D) → (B, n_rooms, D) after expand
-        summaries_exp = room_summaries.unsqueeze(0).expand(B, -1, -1)  # (B, n_rooms, D)
-        # dot product of context with each summary
-        context_exp   = context.unsqueeze(1)                            # (B, 1, D)
-        raw_scores    = (context_exp * summaries_exp).sum(-1)           # (B, n_rooms)
+        # gate_proj + temperature scaling stops sigmoid saturating to 1.0
+        gate_logits = self.gate_proj(context) + warped_scores                   # (B, n)
+        gates       = torch.sigmoid(gate_logits / 2.0)
 
-        # Step 4 — apply adjacency warp to scores
-        # Each room's final score is influenced by its neighbors' raw scores
-        # This makes the routing "topology-aware" — nearby rooms pull each other up
-        warped_scores = (adj * raw_scores.unsqueeze(1)).sum(-1)         # (B, n_rooms)
-
-        # Step 5 — sigmoid gives independent gate per room (not softmax!)
-        # Softmax forces rooms to compete. Sigmoid lets multiple rooms activate together.
-        # This is important — a complex input should activate several rooms at once.
-        gate_scores = torch.sigmoid(warped_scores)   # (B, n_rooms) each in [0, 1]
-
-        # At inference: optionally hard-threshold — rooms either fully ON or OFF
-        # This makes inference faster (skip rooms with gate < 0.5 entirely)
-        if inference_mode:
-            gate_scores = (gate_scores > 0.5).float()
-
-        return gate_scores   # (B, n_rooms)
+        return (gates > 0.5).float() if hard else gates
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -236,19 +235,17 @@ class MindPalace(nn.Module):
         # Stack all room summary vectors into one matrix (n_rooms, D_MODEL)
         return torch.stack([r.summary for r in self.rooms])
 
-    def forward(self, x):
-        summaries   = self.get_summaries()               # (n_rooms, D)
-        gate_scores = self.router(x, summaries)          # (B, n_rooms)
+    def forward(self, x, hard=False):
+        summaries   = self.get_summaries()
+        gate_scores = self.router(x, summaries, hard=hard)
 
-        # Pass x through every room, weighted by its gate score
         out = x
         for i, room in enumerate(self.rooms):
-            g    = gate_scores[:, i]       # (B,) — gate score for this room
-            out  = room(out, g)
-            # Update heat (detach so this doesn't affect gradients)
+            g   = gate_scores[:, i]
+            out = room(out, g)
             room.update_heat(g.mean().detach().item())
 
-        return out
+        return out, gate_scores
 
     def manage_rooms(self, current_loss, prev_loss, loss_history):
         """
@@ -319,37 +316,29 @@ class MindPalaceLLM(nn.Module):
         self.norm       = nn.LayerNorm(D_MODEL)
         self.head       = nn.Linear(D_MODEL, VOCAB_SIZE)
 
-    def forward(self, token_ids, targets=None):
-        B, T   = token_ids.shape
-        x      = self.token_emb(token_ids) + self.pos_emb(torch.arange(T, device=token_ids.device))
-        x      = self.palace(x)
-        x      = self.norm(x)
-        logits = self.head(x)
-        loss   = None
+    def forward(self, token_ids, targets=None, hard=False):
+        B, T     = token_ids.shape
+        x        = self.token_emb(token_ids) + self.pos_emb(torch.arange(T, device=token_ids.device))
+        x, gates = self.palace(x, hard=hard)
+        logits   = self.head(self.norm(x))
+        loss     = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
+            ce_loss      = F.cross_entropy(logits.view(-1, VOCAB_SIZE), targets.view(-1))
+            mean_gate    = gates.mean(dim=0)
+            balance_loss = -mean_gate.var()
+            loss         = ce_loss + 0.01 * balance_loss
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, prompt, max_new_tokens=300, temperature=0.8, inference_mode=False):
+    def generate(self, prompt, max_new_tokens=300, temperature=0.8, hard=False):
         self.eval()
-        # Temporarily patch router to use inference_mode if requested
-        original_forward = self.palace.router.forward
-        if inference_mode:
-            def inf_forward(x, summaries):
-                return original_forward(x, summaries, inference_mode=True)
-            self.palace.router.forward = inf_forward
-
         ids = torch.tensor(encode(prompt), dtype=torch.long).unsqueeze(0).to(device)
         for _ in range(max_new_tokens):
             crop      = ids[:, -SEQ_LEN:]
-            logits, _ = self(crop)
+            logits, _ = self(crop, hard=hard)
             probs     = F.softmax(logits[:, -1, :] / temperature, dim=-1)
             next_id   = torch.multinomial(probs, 1)
             ids       = torch.cat([ids, next_id], dim=1)
-
-        if inference_mode:
-            self.palace.router.forward = original_forward
         self.train()
         return decode(ids[0].tolist())
 
@@ -410,11 +399,25 @@ for step in range(STEPS):
                 # Rebuild optimizer whenever rooms change (parameters added/removed)
                 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
 
+        # if step > 0 and step % 2000 == 0:
+        #     print("\n--- sample (normal) ---")
+        #     print(model.generate("ROMEO:", max_new_tokens=200))
+        #     print("\n--- sample (hard gates) ---")
+        #     print(model.generate("ROMEO:", max_new_tokens=200, hard=True))
+        #     print()
+
         if step > 0 and step % 2000 == 0:
-            print("\n--- sample (normal) ---")
-            print(model.generate("ROMEO:", max_new_tokens=200))
-            print("\n--- sample (inference mode: hard gates) ---")
-            print(model.generate("ROMEO:", max_new_tokens=200, inference_mode=True))
+            prompts = [
+                "The future of artificial intelligence",
+                "In this article we discuss",
+                "One of the most important discoveries",
+            ]
+            for p in prompts:
+                print(f"\n--- sample: {p} ---")
+                print(model.generate(p, max_new_tokens=200))
+
+            print("\n--- sample (hard gates) ---")
+            print(model.generate("The future of artificial intelligence", max_new_tokens=200, hard=True))
             print()
 
 print("\n=== Final output ===")
