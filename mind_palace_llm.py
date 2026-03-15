@@ -19,13 +19,12 @@ EVAL_EVERY     = 500
 EVAL_STEPS     = 30
 
 # Mind Palace specific
-N_ROOMS        = 6      # start with 6 rooms
+N_ROOMS        = 1      # START WITH 1 — rooms are earned, not given
 MAX_ROOMS      = 10     # never grow beyond this
-MIN_ROOMS      = 2      # never shrink below this
-HEAT_DECAY     = 0.999  # each step: heat = heat * decay (slowly cools unused rooms)
-HEAT_SPAWN     = 0.05   # spawn a new room if loss improvement stalls AND max heat < this... jk
-DELETE_THRESH  = 0.02   # delete a room if its heat drops below this
-SPAWN_PATIENCE = 500    # steps to wait before considering spawning
+MIN_ROOMS      = 1      # never shrink below this
+HEAT_DECAY     = 0.990  # faster decay — unused rooms cool in ~300 steps
+DELETE_THRESH  = 0.30   # delete if heat drops below 30% — actually reachable now
+SPAWN_PATIENCE = 300    # wait this many steps before first spawn check
 
 # ── DATA ──────────────────────────────────────────────────────────────────────
 DATA_URL  = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -251,35 +250,53 @@ class MindPalace(nn.Module):
 
         return out
 
-    def manage_rooms(self, current_loss, prev_loss):
+    def manage_rooms(self, current_loss, prev_loss, loss_history):
         """
         Called every N steps during training.
         Deletes cold rooms and spawns new ones if needed.
         Returns a log string describing what happened.
+
+        Spawn logic — smarter than before:
+          We keep a window of recent losses. If the improvement rate is
+          slowing down (we're on a plateau), spawn a new room to give the
+          model more capacity to break through.
         """
         log = []
 
         # ── DELETE cold rooms ──
         if self.n_rooms > MIN_ROOMS:
-            to_delete = [i for i, r in enumerate(self.rooms) if r.heat.item() < DELETE_THRESH]
-            for i in sorted(to_delete, reverse=True):   # reverse so indices stay valid
-                log.append(f"  deleted room {self.rooms[i].room_id} (heat={self.rooms[i].heat.item():.4f})")
+            to_delete = [i for i, r in enumerate(self.rooms)
+                         if r.heat.item() < DELETE_THRESH]
+            for i in sorted(to_delete, reverse=True):
+                log.append(f"  🗑  deleted room {self.rooms[i].room_id} "
+                           f"(heat={self.rooms[i].heat.item():.3f})")
                 self.rooms.pop(i)
             if to_delete:
                 self._rebuild_router()
 
-        # ── SPAWN new room if loss is not improving and we have capacity ──
-        loss_stalled = (prev_loss - current_loss) < 0.005
-        if loss_stalled and self.n_rooms < MAX_ROOMS:
-            new_id = max(r.room_id for r in self.rooms) + 1
-            new_room = Room(self.d_model, self.n_heads, self.d_ff, room_id=new_id).to(
-                next(self.parameters()).device
-            )
-            # Initialize new room's heat to medium so it gets a chance to prove itself
-            new_room.heat.fill_(0.3)
-            self.rooms.append(new_room)
-            self._rebuild_router()
-            log.append(f"  spawned room {new_id} (loss stalled at {current_loss:.4f})")
+        # ── SPAWN when improvement is slowing ──
+        if self.n_rooms < MAX_ROOMS and len(loss_history) >= 3:
+            # How much did loss improve over the last 3 evals?
+            recent_drop   = loss_history[-3] - loss_history[-1]
+            # How much did it improve in the 3 evals before that?
+            if len(loss_history) >= 6:
+                earlier_drop = loss_history[-6] - loss_history[-4]
+            else:
+                earlier_drop = recent_drop + 1   # force no spawn early on
+
+            # Spawn if recent improvement is less than 40% of earlier improvement
+            # i.e. we're clearly slowing down and more capacity might help
+            improvement_ratio = recent_drop / (earlier_drop + 1e-8)
+            if improvement_ratio < 0.4 and recent_drop < 0.1:
+                new_id   = max(r.room_id for r in self.rooms) + 1
+                new_room = Room(self.d_model, self.n_heads, self.d_ff,
+                                room_id=new_id).to(next(self.parameters()).device)
+                new_room.heat.fill_(0.5)   # warm start — give it a fair chance
+                self.rooms.append(new_room)
+                self._rebuild_router()
+                log.append(f"  ✨ spawned room {new_id} "
+                           f"(improvement slowing: ratio={improvement_ratio:.2f}, "
+                           f"loss={current_loss:.4f})")
 
         return log
 
@@ -361,8 +378,8 @@ def estimate_loss():
     model.train()
     return out
 
-prev_loss = float('inf')
-start     = time.time()
+loss_history = []   # track eval losses over time for spawn decisions
+start        = time.time()
 
 for step in range(STEPS):
     xb, yb  = get_batch('train')
@@ -376,20 +393,22 @@ for step in range(STEPS):
     if step % EVAL_EVERY == 0 or step == STEPS - 1:
         losses  = estimate_loss()
         elapsed = (time.time() - start) / 60
-        print(f"step {step:5d}  |  train: {losses['train']:.4f}  val: {losses['val']:.4f}  |  {elapsed:.1f} min")
+        loss_history.append(losses['train'])
+        print(f"step {step:5d}  |  train: {losses['train']:.4f}  val: {losses['val']:.4f}"
+              f"  |  rooms: {model.palace.n_rooms}  |  {elapsed:.1f} min")
 
         # Show room heat map
         model.room_status()
 
         # Let the palace manage itself — delete cold rooms, spawn if needed
-        if step > SPAWN_PATIENCE:
-            logs = model.palace.manage_rooms(losses['train'], prev_loss)
-            for log in logs: print(log)
+        if step >= SPAWN_PATIENCE:
+            prev = loss_history[-2] if len(loss_history) >= 2 else float('inf')
+            logs = model.palace.manage_rooms(losses['train'], prev, loss_history)
+            for lg in logs:
+                print(lg)
             if logs:
-                # Rebuild optimizer when rooms change (new params added/removed)
+                # Rebuild optimizer whenever rooms change (parameters added/removed)
                 optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-
-        prev_loss = losses['train']
 
         if step > 0 and step % 2000 == 0:
             print("\n--- sample (normal) ---")
