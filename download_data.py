@@ -18,7 +18,7 @@ chunks = []
 print("downloading UltraChat...")
 
 # ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train[:20000]")
-ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:20000]")
+ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft[:100000]")
 
 for row in ds:
     convo = row["messages"]
