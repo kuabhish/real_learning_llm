@@ -19,12 +19,12 @@ EVAL_STEPS    = 30
 
 # Mind Palace
 N_ROOMS       = 2       # start tiny — rooms earn the right to exist
-MAX_ROOMS     = 8
+MAX_ROOMS     = 16
 MIN_ROOMS     = 1
 HEAT_DECAY    = 0.990
 DELETE_THRESH = 0.10    # was 0.25 — give rooms more time before deleting
 SPLIT_THRESH  = 0.95
-SPLIT_STREAK  = 8       # was 5 — wait longer before splitting again
+SPLIT_STREAK  = 5       # was 5 — wait longer before splitting again
 SPAWN_PAT     = 400     # steps before first manage call
 MAX_HOPS      = 3       # max rooms to traverse per forward pass
 
@@ -34,6 +34,13 @@ TARGET    = 100_000_000
 
 with open(DATA_PATH, encoding="utf-8") as f:
     text = f.read()
+
+# remove weird unicode symbols (fixes huge vocab problem)
+text = text.encode("ascii", "ignore").decode()
+# normalize whitespace
+text = text.replace("\r", "")
+text = text.replace("\t", " ")
+
 print(f"Dataset: {len(text)/1e6:.1f}MB")
 
 chars      = sorted(set(text))
@@ -331,7 +338,7 @@ class MindPalaceLLM(nn.Module):
         return logits, loss, n_visited
 
     @torch.no_grad()
-    def generate(self, prompt, max_new_tokens=300, temp=0.8, hard=False):
+    def generate(self, prompt, max_new_tokens=300, temp=0.5, hard=False):
         self.eval()
         ids = torch.tensor(encode(prompt), dtype=torch.long).unsqueeze(0).to(device)
         for _ in range(max_new_tokens):
