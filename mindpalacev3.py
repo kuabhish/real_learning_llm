@@ -23,8 +23,8 @@ MAX_ROOMS     = 16
 MIN_ROOMS     = 1
 HEAT_DECAY    = 0.990
 DELETE_THRESH = 0.10
-SPLIT_THRESH  = 0.9
-SPLIT_STREAK  = 5
+SPLIT_THRESH  = 0.78
+SPLIT_STREAK  = 2
 SPAWN_PAT     = 400
 MAX_HOPS      = 3
 
@@ -456,6 +456,7 @@ for step in range(STEPS):
                             optimizer.state[new_params[pid]] = old_state['state'][pid]
 
         if step > 0 and step % 2000 == 0:
+            torch.save(model.state_dict(), "mindpalace_v3.pt")
             for p in ["The future of artificial intelligence",
                       "In this article we discuss",
                       "One of the most important discoveries"]:
