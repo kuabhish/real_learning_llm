@@ -23,43 +23,20 @@ MAX_ROOMS     = 16
 MIN_ROOMS     = 1
 HEAT_DECAY    = 0.990
 DELETE_THRESH = 0.10
-SPLIT_THRESH  = 0.78
+SPLIT_THRESH  = 0.85
 SPLIT_STREAK  = 2
 SPAWN_PAT     = 400
 MAX_HOPS      = 3
 
 import tiktoken
-
-DATA_PATH = "data.txt"
-
-with open(DATA_PATH, encoding="utf-8") as f:
-    text = f.read()
-# text = text.encode("ascii", "ignore").decode()
-text = text.replace("\r", "").replace("\t", " ")
-print(f"Dataset: {len(text)/1e6:.1f}MB")
-
 enc        = tiktoken.get_encoding("gpt2")
 VOCAB_SIZE = enc.n_vocab  # 50257
 encode     = lambda s: enc.encode(s)
 decode     = lambda ids: enc.decode(ids)
 
-data  = torch.tensor(encode(text), dtype=torch.long)
-n     = int(0.9 * len(data))
-train = data[:n].to(device)
-val   = data[n:].to(device)
-print(f"Vocab: {VOCAB_SIZE} | Train: {len(train):,} | Val: {len(val):,}")
-
-def get_batch(split):
-    d  = train if split == 'train' else val
-    ix = torch.randint(len(d) - SEQ_LEN, (BATCH_SIZE,))
-    x  = torch.stack([d[i:i+SEQ_LEN]     for i in ix])
-    y  = torch.stack([d[i+1:i+SEQ_LEN+1] for i in ix])
-    return x, y
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ATTENTION GATE  — sits before self-attention in each room
-#  scalar in [0,1]: 0 = room does nothing, 1 = full processing
+#  ATTENTION GATE
 # ══════════════════════════════════════════════════════════════════════════════
 class AttentionGate(nn.Module):
     def __init__(self, d_model):
@@ -69,14 +46,14 @@ class AttentionGate(nn.Module):
             nn.GELU(),
             nn.Linear(d_model // 4, 1),
         )
-        nn.init.constant_(self.gate_net[-1].bias, 1.0)   # start open
+        nn.init.constant_(self.gate_net[-1].bias, 1.0)
 
     def forward(self, x, hard=False):
         ctx  = x.mean(dim=1)
-        gate = torch.sigmoid(self.gate_net(ctx))          # (B, 1)
+        gate = torch.sigmoid(self.gate_net(ctx))
         if hard:
             gate = (gate > 0.5).float()
-        return x * gate.unsqueeze(1), gate.squeeze(-1)    # (B,T,D), (B,)
+        return x * gate.unsqueeze(1), gate.squeeze(-1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -263,7 +240,7 @@ class MindPalace(nn.Module):
                     self.rooms.pop(i)
                     self.rooms.insert(i,   ca)
                     self.rooms.insert(i+1, cb)
-                    self._rebuild_router(split_idx=i)   # ← pass the split position
+                    self._rebuild_router(split_idx=i)
                     break
 
         elif self.n_rooms < MAX_ROOMS and len(loss_history) >= 6:
@@ -302,7 +279,7 @@ class MindPalace(nn.Module):
         new_router = MindPalaceRouter(self.d_model, new_n).to(self.dev)
 
         with torch.no_grad():
-            old_adj = old_router.base_adj.data   # (old_n, old_n)
+            old_adj = old_router.base_adj.data
 
             if new_n == old_n + 1 and split_idx is not None:
                 # ── split case: room at split_idx → two children ──
@@ -319,16 +296,14 @@ class MindPalace(nn.Module):
 
                 # two children inherit parent row/col + small divergence
                 parent_row = old_adj[split_idx]
-                parent_col = old_adj[:, split_idx]
                 noise = 0.05
                 new_adj[split_idx,   :] = F.pad(parent_row[:split_idx], (0, new_n - split_idx))
                 new_adj[split_idx+1, :] = F.pad(parent_row[:split_idx], (0, new_n - split_idx))
                 new_adj[split_idx,   split_idx]   = old_adj[split_idx, split_idx]
                 new_adj[split_idx+1, split_idx+1] = old_adj[split_idx, split_idx]
-                new_adj[split_idx,   split_idx+1] = 0.5   # siblings are close
+                new_adj[split_idx,   split_idx+1] = 0.5
                 new_adj[split_idx+1, split_idx]   = 0.5
                 new_adj += torch.randn_like(new_adj) * noise
-
                 new_router.base_adj.data.copy_(new_adj)
 
             elif new_n < old_n:
@@ -345,9 +320,8 @@ class MindPalace(nn.Module):
             # copy context_proj and gate_proj weights (input size unchanged)
             new_router.context_proj.load_state_dict(old_router.context_proj.state_dict())
 
-            # gate_proj: copy old weights, zero-init new room's column
-            old_w = old_router.gate_proj.weight.data   # (old_n, D)
-            old_b = old_router.gate_proj.bias.data     # (old_n,)
+            old_w = old_router.gate_proj.weight.data
+            old_b = old_router.gate_proj.bias.data
             if new_n >= old_n:
                 new_router.gate_proj.weight.data[:old_n] = old_w
                 new_router.gate_proj.bias.data[:old_n]   = old_b
@@ -407,64 +381,87 @@ class MindPalaceLLM(nn.Module):
         print()
 
 
-# ── TRAINING ──────────────────────────────────────────────────────────────────
-model     = MindPalaceLLM().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}  |  Rooms: {N_ROOMS}\n")
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRAINING  — only runs when executed directly, not when imported
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print(f"Using device: {device}")
 
-@torch.no_grad()
-def estimate_loss():
-    model.eval()
-    out = {}
-    for split in ['train', 'val']:
-        losses = [model(xb, yb)[1].item() for xb, yb in
-                  (get_batch(split) for _ in range(EVAL_STEPS))]
-        out[split] = sum(losses) / len(losses)
-    model.train()
-    return out
+    DATA_PATH = "data.txt"
+    with open(DATA_PATH, encoding="utf-8") as f:
+        text = f.read()
+    text = text.replace("\r", "").replace("\t", " ")
+    print(f"Dataset: {len(text)/1e6:.1f}MB")
 
-loss_history, start = [], time.time()
+    data  = torch.tensor(encode(text), dtype=torch.long)
+    n     = int(0.9 * len(data))
+    train = data[:n].to(device)
+    val   = data[n:].to(device)
+    print(f"Vocab: {VOCAB_SIZE} | Train: {len(train):,} | Val: {len(val):,}")
 
-for step in range(STEPS):
-    xb, yb      = get_batch('train')
-    _, loss, nv = model(xb, yb)
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
+    def get_batch(split):
+        d  = train if split == 'train' else val
+        ix = torch.randint(len(d) - SEQ_LEN, (BATCH_SIZE,))
+        x  = torch.stack([d[i:i+SEQ_LEN]     for i in ix])
+        y  = torch.stack([d[i+1:i+SEQ_LEN+1] for i in ix])
+        return x, y
 
-    if step % EVAL_EVERY == 0 or step == STEPS - 1:
-        losses  = estimate_loss()
-        elapsed = (time.time() - start) / 60
-        loss_history.append(losses['train'])
-        print(f"step {step:5d}  train={losses['train']:.4f}  val={losses['val']:.4f}"
-              f"  rooms={model.palace.n_rooms}  {elapsed:.1f}min")
-        model.room_status()
+    model     = MindPalaceLLM().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}  |  Rooms: {N_ROOMS}\n")
 
-        if step >= SPAWN_PAT:
-            logs = model.palace.manage_rooms(losses['train'], loss_history)
-            for lg in logs: print(lg)
-            if logs:
-                # partial optimizer reset: keep most momentum, reset only new params
-                old_state = optimizer.state_dict()
-                optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-                # copy state for params that still exist (by tensor id)
-                new_params  = {id(p): p for p in model.parameters()}
-                for group in old_state['param_groups']:
-                    for pid in group['params']:
-                        if pid in old_state['state'] and pid in new_params:
-                            optimizer.state[new_params[pid]] = old_state['state'][pid]
+    @torch.no_grad()
+    def estimate_loss():
+        model.eval()
+        out = {}
+        for split in ['train', 'val']:
+            losses = [model(xb, yb)[1].item() for xb, yb in
+                      (get_batch(split) for _ in range(EVAL_STEPS))]
+            out[split] = sum(losses) / len(losses)
+        model.train()
+        return out
 
-        if step > 0 and step % 2000 == 0:
-            torch.save(model.state_dict(), "mindpalace_v3.pt")
-            for p in ["The future of artificial intelligence",
-                      "In this article we discuss",
-                      "One of the most important discoveries"]:
-                print(f"\n--- {p} ---")
-                print(model.generate(p, max_new_tokens=150))
+    loss_history, start = [], time.time()
 
-print("\n=== Final ===")
-print(model.generate("The future of artificial intelligence", max_new_tokens=400))
-model.room_status()
-torch.save(model.state_dict(), "mindpalace_v3.pt")
-print("Saved.")
+    for step in range(STEPS):
+        xb, yb      = get_batch('train')
+        _, loss, nv = model(xb, yb)
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        if step % EVAL_EVERY == 0 or step == STEPS - 1:
+            losses  = estimate_loss()
+            elapsed = (time.time() - start) / 60
+            loss_history.append(losses['train'])
+            print(f"step {step:5d}  train={losses['train']:.4f}  val={losses['val']:.4f}"
+                  f"  rooms={model.palace.n_rooms}  {elapsed:.1f}min")
+            model.room_status()
+
+            if step >= SPAWN_PAT:
+                logs = model.palace.manage_rooms(losses['train'], loss_history)
+                for lg in logs: print(lg)
+                if logs:
+                    old_state  = optimizer.state_dict()
+                    optimizer  = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+                    new_params = {id(p): p for p in model.parameters()}
+                    for group in old_state['param_groups']:
+                        for pid in group['params']:
+                            if pid in old_state['state'] and pid in new_params:
+                                optimizer.state[new_params[pid]] = old_state['state'][pid]
+
+            if step > 0 and step % 2000 == 0:
+                torch.save(model.state_dict(), "mindpalace_v3.pt")
+                for p in ["The future of artificial intelligence",
+                          "In this article we discuss",
+                          "One of the most important discoveries"]:
+                    print(f"\n--- {p} ---")
+                    print(model.generate(p, max_new_tokens=150))
+
+    print("\n=== Final ===")
+    print(model.generate("The future of artificial intelligence", max_new_tokens=400))
+    model.room_status()
+    torch.save(model.state_dict(), "mindpalace_v3.pt")
+    print("Saved.")
+    
